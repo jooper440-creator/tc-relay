@@ -234,6 +234,37 @@ def trim_history(m):
         del h[:-MAX_HISTORY]
 
 
+MIN_PLAY_GAP = 10  # seconds; two plays/wins on one machine can never be closer
+
+
+def apply_prize_meta(m, data):
+    """Prize title, label, picture etc. — per-prize facts that never touch the
+    shared count, so any connection may apply them."""
+    # Only MACHINE_INIT carries these — capture once and keep them for the
+    # life of the tracked machine.
+    if data.get("machineType") is not None:
+        m["machineType"] = data["machineType"]
+    prize = data.get("prize")
+    if prize:
+        title = prize.get("title")
+        if title:
+            if "en" in title:
+                m["prizeTitleEn"] = title["en"]
+            if "ja" in title:
+                m["prizeTitleJa"] = title["ja"]
+        if "gemCost" in prize:
+            m["gemCost"] = prize["gemCost"]
+        # Label such as "LAST_CHANCE" (MACHINE_INIT > data > prize > label).
+        # Re-read on every full prize object so it also clears when
+        # TokyoCatch removes the label from a prize.
+        if "label" in prize or "title" in prize:
+            m["prizeLabel"] = prize.get("label")
+        # Prize picture (MACHINE_INIT > data > prize > imageUrl).
+        # Only overwrite when TokyoCatch actually sends one.
+        if prize.get("imageUrl"):
+            m["prizeImageUrl"] = prize["imageUrl"]
+
+
 def handle_status_data(m, data):
     trim_history(m)
     status = data.get("status")
@@ -245,18 +276,26 @@ def handle_status_data(m, data):
     # A new play begins when status moves INTO "playing" from either
     # play_wait (a fresh play starting) or continue (another attempt in the
     # same session).
+    now_ts = time.time()
     if status == "playing" and last_status in ("play_wait", "continue"):
-        m["livePlays"] = m.get("livePlays", 0) + 1
-        m.setdefault("history", []).append({
-            "t": now_iso(),
-            "step": m["livePlays"],
-            "sinceWin": m["livePlays"],
-            "player": player_id or "",
-            "isWin": False,
-        })
+        # A real play takes far longer than MIN_PLAY_GAP, so a second "play"
+        # inside that window is an echo of the same one and is not counted.
+        if now_ts - (m.get("lastPlayAt") or 0.0) < MIN_PLAY_GAP:
+            log(f"{m['machineId']}: ignored a play {now_ts - m['lastPlayAt']:.1f}s after the last one (echo)")
+        else:
+            m["lastPlayAt"] = now_ts
+            m["livePlays"] = m.get("livePlays", 0) + 1
+            m.setdefault("history", []).append({
+                "t": now_iso(),
+                "step": m["livePlays"],
+                "sinceWin": m["livePlays"],
+                "player": player_id or "",
+                "isWin": False,
+            })
     # "get" is the confirmed win signal: log it, snapshot the count that led
     # to it, then reset the running counter back to zero.
-    elif status == "get" and last_status != "get":
+    elif status == "get" and last_status != "get" and now_ts - (m.get("lastWinAt") or 0.0) >= MIN_PLAY_GAP:
+        m["lastWinAt"] = now_ts
         win_player = player_id or ""
         history = m.setdefault("history", [])
         last_row = history[-1] if history else None
@@ -295,29 +334,7 @@ def handle_status_data(m, data):
     # change. status -> "playable" means the player stopped; no count
     # change either way.
 
-    # Only MACHINE_INIT carries these — capture once and keep them for the
-    # life of the tracked machine.
-    if data.get("machineType") is not None:
-        m["machineType"] = data["machineType"]
-    prize = data.get("prize")
-    if prize:
-        title = prize.get("title")
-        if title:
-            if "en" in title:
-                m["prizeTitleEn"] = title["en"]
-            if "ja" in title:
-                m["prizeTitleJa"] = title["ja"]
-        if "gemCost" in prize:
-            m["gemCost"] = prize["gemCost"]
-        # Label such as "LAST_CHANCE" (MACHINE_INIT > data > prize > label).
-        # Re-read on every full prize object so it also clears when
-        # TokyoCatch removes the label from a prize.
-        if "label" in prize or "title" in prize:
-            m["prizeLabel"] = prize.get("label")
-        # Prize picture (MACHINE_INIT > data > prize > imageUrl).
-        # Only overwrite when TokyoCatch actually sends one.
-        if prize.get("imageUrl"):
-            m["prizeImageUrl"] = prize["imageUrl"]
+    apply_prize_meta(m, data)
 
     if status:
         m["lastStatus"] = status
@@ -377,6 +394,7 @@ def new_machine_state(machine_id, prize_id):
 # counted twice.
 # ---------------------------------------------------------------------------
 SHARED_FIELDS = ("livePlays", "history", "lastAutoWin", "lastStatus", "lastFields",
+                 "lastPlayAt", "lastWinAt",
                  "threeClawUsualRate", "threeClawLastPayoutOwed", "threeClawPayout")
 
 
@@ -522,6 +540,32 @@ async def keepalive(key, upstream):
         pass
 
 
+# Several prizes on one machine each have their own connection, and all of
+# them receive the same events. Their timing differs by up to a second or
+# more, so letting them all feed one shared status let events arrive out of
+# order and be counted twice. Instead ONE connection per machine (the
+# "leader") drives the shared count; the others only keep their prize
+# details (title, picture, label) current. Leadership passes on if the
+# leader goes quiet, is flagged irrelevant, or disconnects.
+LEADER_TIMEOUT = 30
+_leader = {}   # machineId -> (prize key, time of its last event)
+
+
+def claim_leader(machine_id, key):
+    now = time.monotonic()
+    cur = _leader.get(machine_id)
+    if cur is None or cur[0] == key or now - cur[1] > LEADER_TIMEOUT:
+        _leader[machine_id] = (key, now)
+        return True
+    return False
+
+
+def resign_leader(machine_id, key):
+    cur = _leader.get(machine_id)
+    if cur and cur[0] == key:
+        _leader.pop(machine_id, None)
+
+
 async def pump_upstream(key):
     """Read messages from TokyoCatch for this machine, update shared state,
     persist it, and broadcast the update to every connected browser."""
@@ -544,6 +588,7 @@ async def pump_upstream(key):
                     log(f"{key}: TokyoCatch error message: {raw}")
                     if not m.get("prizeStale"):
                         m["prizeStale"] = True
+                        resign_leader(m["machineId"], key)
                         # Flips to True only if TokyoCatch actually keeps
                         # sending play data after the error — see below.
                         m["dataSinceStale"] = False
@@ -569,6 +614,14 @@ async def pump_upstream(key):
                 # Load the machine's other prize records first, then handle the
                 # event and mirror the result with no await in between, so two
                 # connections can never interleave inside one update.
+                if not claim_leader(m["machineId"], key):
+                    # Another connection on this machine drives the count.
+                    apply_prize_meta(m, msg.get("data") or {})
+                    if not m.get("prizeStale"):
+                        m["liveStatus"] = {"ok": True, "msg": "Live — last update " + now_iso()}
+                    await store.save(key, m)
+                    await broadcast_machine(m)
+                    continue
                 sibs = await siblings_of(m["machineId"], key)
                 before = shared_sig(m)
                 handle_status_data(m, msg.get("data") or {})
@@ -589,6 +642,8 @@ async def pump_upstream(key):
     except Exception as e:
         log(f"Upstream for {key} closed: {e}")
     finally:
+        mid = key.split(":", 1)[0]
+        resign_leader(mid, key)
         m = await store.load(key)
         if m is not None:
             m["liveStatus"] = {"ok": False, "msg": "Upstream connection to TokyoCatch closed — reconnecting…"}
