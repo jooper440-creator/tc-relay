@@ -71,6 +71,7 @@ LEADER_TIMEOUT = 30        # seconds of silence before another connection takes 
 CONNECT_WINDOW = 60        # seconds over which connections per address are counted
 CONNECT_MAX = 6            # connections allowed per address in that window
 CONNECT_BLOCK = 1800       # seconds an address stays blocked once it goes over
+HEALTH_SECONDS = 300       # how often a memory/health line is written to the log
 
 
 def log(msg):
@@ -611,29 +612,39 @@ async def pump_upstream(key):
                 # Load the machine's other prize records first, then handle the
                 # event and mirror the result with no await in between, so two
                 # connections can never interleave inside one update.
+                # Only changes worth keeping are written to Upstash. The "last
+                # update" time, viewer counts and queue change on almost every
+                # message, so they are shown live but not persisted; the next
+                # real change (a play, a win, a prize detail) saves them.
                 if not claim_leader(m["machineId"], key):
                     # Another connection on this machine drives the count.
                     apply_prize_meta(m, msg.get("data") or {})
                     if not m.get("prizeStale"):
                         m["liveStatus"] = {"ok": True, "msg": "Live — last update " + now_iso()}
-                    await store.save(key, m)
+                    if msg_type == "MACHINE_INIT":   # the only message that carries prize details
+                        await store.save(key, m)
                     await broadcast_machine(m)
                     continue
                 sibs = await siblings_of(m["machineId"], key)
                 before = shared_sig(m)
                 handle_status_data(m, msg.get("data") or {})
-                changed = shared_sig(m) != before
+                after = shared_sig(m)
+                changed = after != before                       # worth sending to browsers
+                durable = after[:-1] != before[:-1] or msg_type == "MACHINE_INIT"   # worth saving
                 mirror_shared(m, sibs)
                 if m.get("prizeStale"):
+                    durable = durable or not m.get("dataSinceStale")
                     m["dataSinceStale"] = True
                     m["liveStatus"] = {"ok": False, "msg": "⚠️ Prize no longer on this machine — plays are counted on the machine as a whole. Last update " + now_iso()}
                 else:
                     m["liveStatus"] = {"ok": True, "msg": "Live — last update " + now_iso()}
-                await store.save(key, m)
+                if durable:
+                    await store.save(key, m)
                 await broadcast_machine(m)
                 if changed:
                     for o in sibs:
-                        await store.save(machine_key(o["machineId"], o["prizeId"]), o)
+                        if durable:
+                            await store.save(machine_key(o["machineId"], o["prizeId"]), o)
                         await broadcast_machine(o)
             # other message types (pings, etc.) are ignored
     except Exception as e:
@@ -1009,10 +1020,33 @@ async def process_request(path, request_headers):
     return None
 
 
+def rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return -1.0
+
+
+async def health_loop():
+    """One log line every HEALTH_SECONDS so a memory problem shows up as a
+    trend (which number keeps growing) instead of a sudden crash."""
+    while True:
+        await asyncio.sleep(HEALTH_SECONDS)
+        log(f"Health: rss={rss_mb():.0f}MB tasks={len(asyncio.all_tasks())} "
+            f"browsers={len(browsers)} upstreams={len(runtime)} cached={len(store._cache)} "
+            f"dirty={len(store._dirty)} pending_broadcasts={len(_bcast_pending)} "
+            f"tracked_addresses={len(_recent_connects)}")
+
+
 async def main():
     await reconcile_groups()
     await resume_all_tracked()
     flusher = asyncio.create_task(store.flush_loop())
+    health = asyncio.create_task(health_loop())
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -1032,6 +1066,7 @@ async def main():
         log(f"Relay listening on 0.0.0.0:{PORT} (HEAD support: {'on' if HEAD_SUPPORT else 'off'})")
         await stop.wait()  # run until Render asks us to shut down
     flusher.cancel()
+    health.cancel()
     await store.flush()  # don't lose the last few seconds of changes on redeploy
     log("Shut down cleanly")
 
