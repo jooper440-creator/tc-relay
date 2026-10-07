@@ -45,11 +45,13 @@ would stop counting. An external pinger (UptimeRobot, HEAD request every
 """
 
 import asyncio
+import gc
 import json
 from http import HTTPStatus
 import os
 import random
 import signal
+import ssl
 import time
 import httpx
 import websockets
@@ -72,6 +74,12 @@ CONNECT_WINDOW = 60        # seconds over which connections per address are coun
 CONNECT_MAX = 6            # connections allowed per address in that window
 CONNECT_BLOCK = 1800       # seconds an address stays blocked once it goes over
 HEALTH_SECONDS = 300       # how often a memory/health line is written to the log
+
+# One TLS context shared by every connection to TokyoCatch. Without it each
+# (re)connection builds its own and re-reads the system certificates, which
+# costs a few MB per connection; after a mass reconnect that memory was not
+# handed back, and the relay grew until Render killed it.
+SSL_CONTEXT = ssl.create_default_context()
 
 
 def log(msg):
@@ -707,6 +715,7 @@ async def start_tracking(machine_id, prize_id, category=None):
                 TOKYOCATCH_WS_URL,
                 additional_headers={"Origin": "https://tokyocatch.com"},
                 compression=None,
+                ssl=SSL_CONTEXT,
             )
         except TypeError:
             # Older/legacy websockets versions use "extra_headers" instead
@@ -715,6 +724,7 @@ async def start_tracking(machine_id, prize_id, category=None):
                 TOKYOCATCH_WS_URL,
                 extra_headers={"Origin": "https://tokyocatch.com"},
                 compression=None,
+                ssl=SSL_CONTEXT,
             )
     except Exception as e:
         existing["liveStatus"] = {"ok": False, "msg": f"Could not connect to TokyoCatch: {e}"}
@@ -1031,12 +1041,29 @@ def rss_mb():
     return -1.0
 
 
+def trim_memory():
+    """Collect cyclic garbage and ask the C allocator to give freed memory
+    back to the OS (glibc only; silently skipped elsewhere). Python frees
+    objects but often keeps the pages, so RSS only creeps up otherwise."""
+    collected = gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    return collected
+
+
 async def health_loop():
     """One log line every HEALTH_SECONDS so a memory problem shows up as a
-    trend (which number keeps growing) instead of a sudden crash."""
+    trend (which number keeps growing) instead of a sudden crash. Memory is
+    trimmed first; the line shows RSS before and after."""
     while True:
         await asyncio.sleep(HEALTH_SECONDS)
-        log(f"Health: rss={rss_mb():.0f}MB tasks={len(asyncio.all_tasks())} "
+        before = rss_mb()
+        collected = trim_memory()
+        log(f"Health: rss={rss_mb():.0f}MB (before cleanup {before:.0f}MB, gc found {collected}) "
+            f"tasks={len(asyncio.all_tasks())} "
             f"browsers={len(browsers)} upstreams={len(runtime)} cached={len(store._cache)} "
             f"dirty={len(store._dirty)} pending_broadcasts={len(_bcast_pending)} "
             f"tracked_addresses={len(_recent_connects)}")
