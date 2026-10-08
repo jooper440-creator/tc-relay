@@ -45,6 +45,7 @@ would stop counting. An external pinger (UptimeRobot, HEAD request every
 """
 
 import asyncio
+import base64
 import gc
 import json
 from http import HTTPStatus
@@ -53,6 +54,7 @@ import random
 import signal
 import ssl
 import time
+import zlib
 import httpx
 import websockets
 
@@ -107,6 +109,21 @@ def machine_key(machine_id, prize_id):
 # set, so `python relay.py` still works for a quick local test without
 # Upstash credentials on hand — just without persistence across restarts.
 # ---------------------------------------------------------------------------
+def pack_state(state):
+    """The JSON stored in Upstash, compressed. Every step-history row repeats
+    the same field names, so it shrinks several times over, and this is the
+    largest thing the relay sends out. The "z1:" prefix lets records saved
+    before compression existed still load."""
+    raw = json.dumps(state, separators=(",", ":")).encode()
+    return "z1:" + base64.b64encode(zlib.compress(raw, 6)).decode()
+
+
+def unpack_state(value):
+    if isinstance(value, str) and value.startswith("z1:"):
+        return json.loads(zlib.decompress(base64.b64decode(value[3:])))
+    return json.loads(value)
+
+
 class Store:
     """State lives in memory (`_cache`) and is the source of truth while the
     relay runs. Upstash is only read at startup (or on a cache miss) and is
@@ -127,11 +144,15 @@ class Store:
                 "(state will NOT survive a restart; fine for local testing, not for production)")
 
     async def _cmd(self, *args):
+        body = json.dumps(list(args))
         resp = await self._client.post(
             UPSTASH_URL,
-            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-            json=list(args),
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}", "Content-Type": "application/json"},
+            content=body,
         )
+        traffic["upstash_calls"] += 1
+        traffic["upstash_out"] += len(body)
+        traffic["upstash_in"] += len(resp.content)
         resp.raise_for_status()
         data = resp.json()
         if data.get("error"):
@@ -159,7 +180,7 @@ class Store:
         raw = await self._cmd("GET", MACHINE_KEY_PREFIX + key)
         if raw is None:
             return None
-        state = json.loads(raw)
+        state = unpack_state(raw)
         self._cache[key] = state
         return state
 
@@ -194,7 +215,7 @@ class Store:
             if state is None:
                 continue  # deleted since it was marked dirty
             try:
-                await self._cmd("SET", MACHINE_KEY_PREFIX + key, json.dumps(state))
+                await self._cmd("SET", MACHINE_KEY_PREFIX + key, pack_state(state))
             except Exception as e:
                 self._dirty.add(key)  # try again next round
                 log(f"Store flush failed for {key}: {e}")
@@ -463,6 +484,7 @@ async def broadcast(msg):
     for ws in list(browsers):
         try:
             await ws.send(raw)
+            traffic["browsers_out"] += len(raw)
         except Exception:
             dead.append(ws)
     for d in dead:
@@ -540,7 +562,7 @@ async def keepalive(key, upstream):
         while True:
             await asyncio.sleep(15)
             try:
-                await upstream.send(json.dumps({"type": "ping"}))
+                await tc_send(upstream, json.dumps({"type": "ping"}))
             except Exception:
                 break
     except asyncio.CancelledError:
@@ -579,6 +601,7 @@ async def pump_upstream(key):
     upstream = rt["upstream"]
     try:
         async for raw in upstream:
+            traffic["tc_in"] += len(raw)
             try:
                 msg = json.loads(raw)
             except Exception:
@@ -732,11 +755,11 @@ async def start_tracking(machine_id, prize_id, category=None):
         await broadcast_machine(existing)
         return False
 
-    await upstream.send(json.dumps({
+    await tc_send(upstream, json.dumps({
         "type": "machineSubscription",
         "data": {"id": machine_id, "prizeId": prize_id, "type": "view"},
     }))
-    await upstream.send(json.dumps({
+    await tc_send(upstream, json.dumps({
         "type": "initClient",
         "data": {"device": "web", "clientVersion": "44e8d84", "language": "en"},
     }))
@@ -1030,6 +1053,22 @@ async def process_request(path, request_headers):
     return None
 
 
+# Bytes of payload moved since the relay started, shown in the Health line so
+# Render's bandwidth numbers can be matched to a cause. (Real network use is a
+# bit higher: headers, TLS and acknowledgements are not counted here.)
+traffic = {"upstash_out": 0, "upstash_in": 0, "upstash_calls": 0,
+           "tc_out": 0, "tc_in": 0, "browsers_out": 0}
+
+
+async def tc_send(upstream, text):
+    traffic["tc_out"] += len(text)
+    await upstream.send(text)
+
+
+def mb(n):
+    return f"{n / 1048576:.1f}"
+
+
 def rss_mb():
     try:
         with open("/proc/self/status") as f:
@@ -1067,6 +1106,9 @@ async def health_loop():
             f"browsers={len(browsers)} upstreams={len(runtime)} cached={len(store._cache)} "
             f"dirty={len(store._dirty)} pending_broadcasts={len(_bcast_pending)} "
             f"tracked_addresses={len(_recent_connects)}")
+        log(f"Traffic since start (MB): upstash out={mb(traffic['upstash_out'])} in={mb(traffic['upstash_in'])} "
+            f"calls={traffic['upstash_calls']} | tokyocatch out={mb(traffic['tc_out'])} in={mb(traffic['tc_in'])} "
+            f"| browsers out={mb(traffic['browsers_out'])}")
 
 
 async def main():
