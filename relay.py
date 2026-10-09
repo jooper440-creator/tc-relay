@@ -256,6 +256,10 @@ def apply_prize_meta(m, data):
     # life of the tracked machine.
     if data.get("machineType") is not None:
         m["machineType"] = data["machineType"]
+    # When true the machine cannot be played with a ticket, so the dashboard
+    # shows the ticket cost as N/A (MACHINE_INIT > data > isDisabledPlayByTicket).
+    if "isDisabledPlayByTicket" in data:
+        m["isDisabledPlayByTicket"] = bool(data["isDisabledPlayByTicket"])
     prize = data.get("prize")
     if prize:
         title = prize.get("title")
@@ -266,6 +270,8 @@ def apply_prize_meta(m, data):
                 m["prizeTitleJa"] = title["ja"]
         if "gemCost" in prize:
             m["gemCost"] = prize["gemCost"]
+        if "ticketCost" in prize:
+            m["ticketCost"] = prize["ticketCost"]
         # Label such as "LAST_CHANCE" (MACHINE_INIT > data > prize > label).
         # Re-read on every full prize object so it also clears when
         # TokyoCatch removes the label from a prize.
@@ -377,6 +383,8 @@ def new_machine_state(machine_id, prize_id):
         "prizeTitleEn": None,
         "prizeTitleJa": None,
         "gemCost": None,
+        "ticketCost": None,
+        "isDisabledPlayByTicket": None,
         "prizeLabel": None,
         "prizeImageUrl": None,
         "prizeStale": False,
